@@ -73,7 +73,9 @@ export interface OptionsState {
     show_ignored_hosts: boolean;
     showhost: boolean;
     ssl_insecure: boolean;
+    ssl_insecure_upstream_hosts: string[];
     ssl_verify_upstream_trusted_ca: string | undefined;
+    ssl_verify_upstream_trusted_ca_by_host: string[];
     ssl_verify_upstream_trusted_confdir: string | undefined;
     stickyauth: string | undefined;
     stickycookie: string | undefined;
@@ -183,7 +185,9 @@ export const defaultState: OptionsState = {
     show_ignored_hosts: false,
     showhost: false,
     ssl_insecure: false,
+    ssl_insecure_upstream_hosts: [],
     ssl_verify_upstream_trusted_ca: undefined,
+    ssl_verify_upstream_trusted_ca_by_host: [],
     ssl_verify_upstream_trusted_confdir: undefined,
     stickyauth: undefined,
     stickycookie: undefined,

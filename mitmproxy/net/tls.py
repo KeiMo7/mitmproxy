@@ -202,6 +202,7 @@ def create_proxy_server_context(
     verify: Verify,
     ca_path: str | None,
     ca_pemfile: str | None,
+    extra_ca_pemfile: str | None,
     client_cert: str | None,
     legacy_server_connect: bool,
 ) -> SSL.Context:
@@ -218,9 +219,15 @@ def create_proxy_server_context(
         ca_pemfile = certifi.where()
     try:
         context.load_verify_locations(ca_pemfile, ca_path)
+        # A per-target trust anchor is added *in addition to* the regular
+        # trust store: matching targets gain one extra anchor, everything else
+        # about chain validation stays intact.
+        if extra_ca_pemfile is not None:
+            context.load_verify_locations(extra_ca_pemfile, None)
     except SSL.Error as e:
         raise RuntimeError(
-            f"Cannot load trusted certificates ({ca_pemfile=}, {ca_path=})."
+            f"Cannot load trusted certificates ({ca_pemfile=}, {ca_path=}, "
+            f"{extra_ca_pemfile=})."
         ) from e
 
     # Client Certs

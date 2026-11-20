@@ -150,3 +150,9 @@ class TlsData:
     """
     If set to `True`, indicates that it is a DTLS event.
     """
+    error_category: str | None = None
+    """
+    Stable, machine-consumable upstream TLS failure category
+    (see ``mitmproxy.net.upstream_trust.TlsFailure``) when the handshake failed.
+    Populated on ``tls_failed_server`` events, otherwise ``None``.
+    """

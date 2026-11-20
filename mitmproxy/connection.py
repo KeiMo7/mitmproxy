@@ -81,6 +81,15 @@ class Connection(serializable.SerializableDataclass, metaclass=ABCMeta):
     property. This property is only reused per client connection.
     """
 
+    tls_error_category: str | None = field(
+        default=None, metadata={"serialize": False}
+    )
+    """
+    Stable, machine-consumable category of an upstream TLS handshake failure
+    (see ``mitmproxy.net.upstream_trust.TlsFailure``). ``None`` if no
+    categorized TLS failure occurred. Never contains certificate material.
+    """
+
     tls: bool = False
     """
     `True` if TLS should be established, `False` otherwise.

@@ -15,6 +15,10 @@ from mitmproxy import connection
 from mitmproxy.connection import TlsVersion
 from mitmproxy.net.tls import starts_like_dtls_record
 from mitmproxy.net.tls import starts_like_tls_record
+from mitmproxy.net.upstream_trust import classify_verify_result
+from mitmproxy.net.upstream_trust import parse_failure_category
+from mitmproxy.net.upstream_trust import strip_failure_prefix
+from mitmproxy.net.upstream_trust import TlsFailure
 from mitmproxy.proxy import commands
 from mitmproxy.proxy import context
 from mitmproxy.proxy import events
@@ -242,6 +246,8 @@ class TlsFailedServerHook(StartHook):
 class TLSLayer(tunnel.TunnelLayer):
     tls: SSL.Connection = None  # type: ignore
     """The OpenSSL connection object"""
+    handshake_error_category: str | None = None
+    """Machine-consumable category of the current/last handshake failure."""
 
     def __init__(self, context: context.Context, conn: connection.Connection):
         super().__init__(
@@ -272,7 +278,22 @@ class TLSLayer(tunnel.TunnelLayer):
         if self.conn == self.context.client:
             yield TlsStartClientHook(tls_start)
         else:
-            yield TlsStartServerHook(tls_start)
+            try:
+                yield TlsStartServerHook(tls_start)
+            except ValueError as e:
+                # Context setup failed before any TLS bytes were exchanged,
+                # e.g. because there is no name to verify against. Route it
+                # through the regular handshake-failure path so that the
+                # connection is closed immediately and a categorized failure
+                # hook fires.
+                category = parse_failure_category(str(e))
+                self.handshake_error_category = (
+                    category or TlsFailure.HANDSHAKE_FAILURE.value
+                )
+                plain = strip_failure_prefix(str(e))
+                yield from self.on_handshake_error(plain)
+                self.tunnel_state = tunnel.TunnelState.CLOSED
+                return
         if not tls_start.ssl_conn:
             yield commands.Log(
                 f"No {self.proto_name} context was provided, failing connection.", ERROR
@@ -307,6 +328,7 @@ class TLSLayer(tunnel.TunnelLayer):
             last_err = (
                 e.args and isinstance(e.args[0], list) and e.args[0] and e.args[0][-1]
             )
+            failure: TlsFailure
             if last_err in [
                 (
                     "SSL routines",
@@ -319,6 +341,9 @@ class TLSLayer(tunnel.TunnelLayer):
                 error = SSL._ffi.string(  # type: ignore
                     SSL._lib.X509_verify_cert_error_string(verify_result)  # type: ignore
                 ).decode()
+                failure = classify_verify_result(verify_result)
+                # Keep the historical error wording byte-identical; the
+                # category is exposed separately on the connection/hook data.
                 err = f"Certificate verify failed: {error}"
             elif last_err in [
                 ("SSL routines", "ssl3_read_bytes", "tlsv1 alert unknown ca"),
@@ -329,6 +354,7 @@ class TLSLayer(tunnel.TunnelLayer):
                 ("SSL routines", "", "ssl/tls alert bad certificate"),  # OpenSSL 3.2+
             ]:
                 assert isinstance(last_err, tuple)
+                failure = TlsFailure.UNTRUSTED_CHAIN
                 err = last_err[2]
             elif (
                 last_err
@@ -340,17 +366,21 @@ class TLSLayer(tunnel.TunnelLayer):
                 ]
                 and data[:4].isascii()
             ):
-                err = f"The remote server does not speak TLS."
+                failure = TlsFailure.NOT_TLS
+                err = "The remote server does not speak TLS."
             elif last_err in [
                 ("SSL routines", "ssl3_read_bytes", "tlsv1 alert protocol version"),
                 ("SSL routines", "", "tlsv1 alert protocol version"),  # OpenSSL 3+
             ]:
+                failure = TlsFailure.HANDSHAKE_FAILURE
                 err = (
-                    f"The remote server and mitmproxy cannot agree on a TLS version to use. "
-                    f"You may need to adjust mitmproxy's tls_version_server_min option."
+                    "The remote server and mitmproxy cannot agree on a TLS version to use. "
+                    "You may need to adjust mitmproxy's tls_version_server_min option."
                 )
             else:
+                failure = TlsFailure.HANDSHAKE_FAILURE
                 err = f"OpenSSL {e!r}"
+            self.handshake_error_category = failure.value
             return False, err
         else:
             # Here we set all attributes that are only known *after* the handshake.
@@ -398,11 +428,25 @@ class TLSLayer(tunnel.TunnelLayer):
             return True, None
 
     def on_handshake_error(self, err: str) -> layer.CommandGenerator[None]:
+        # The category is computed where the failure is detected (either the
+        # handshake itself or context setup in start_tls). If none was recorded
+        # the transport broke before/during the handshake.
+        category = (
+            self.handshake_error_category
+            or parse_failure_category(err)
+            or TlsFailure.TRANSPORT_INTERRUPTED.value
+        )
+        self.handshake_error_category = category
         self.conn.error = err
+        self.conn.tls_error_category = category
         if self.conn == self.context.client:
-            yield TlsFailedClientHook(TlsData(self.conn, self.context, self.tls))
+            hook_data = TlsData(self.conn, self.context, self.tls)
+            hook_data.error_category = category
+            yield TlsFailedClientHook(hook_data)
         else:
-            yield TlsFailedServerHook(TlsData(self.conn, self.context, self.tls))
+            hook_data = TlsData(self.conn, self.context, self.tls)
+            hook_data.error_category = category
+            yield TlsFailedServerHook(hook_data)
         yield from super().on_handshake_error(err)
 
     def receive_data(self, data: bytes) -> layer.CommandGenerator[None]:
@@ -508,7 +552,10 @@ class ServerTLSLayer(TLSLayer):
             yield from super().event_to_child(event)
 
     def on_handshake_error(self, err: str) -> layer.CommandGenerator[None]:
-        yield commands.Log(f"Server TLS handshake failed. {err}", level=WARNING)
+        yield commands.Log(
+            f"Server TLS handshake failed. {strip_failure_prefix(err)}",
+            level=WARNING,
+        )
         yield from super().on_handshake_error(err)
 
 

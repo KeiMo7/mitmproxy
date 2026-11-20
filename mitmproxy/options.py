@@ -195,6 +195,39 @@ class Options(optmanager.OptManager):
             "Path to a PEM formatted trusted CA certificate.",
         )
         self.add_option(
+            "ssl_verify_upstream_trusted_ca_by_host",
+            Sequence[str],
+            [],
+            """
+            Add per-target trusted CA certificates for upstream server
+            verification. Entries use the format ``<host>=<path to PEM CA>``.
+
+            The extra trust anchor only applies to upstreams whose SNI or
+            connection address matches ``<host>`` (domain name or literal IP
+            address). All other targets continue to use the regular trust
+            store. Unlike ``ssl_insecure``, verification stays enabled and the
+            rest of the chain must still validate. Each match is logged.
+            Files are read and validated when the option is set, so a missing
+            or malformed anchor raises an options error immediately.
+            """,
+        )
+        self.add_option(
+            "ssl_insecure_upstream_hosts",
+            Sequence[str],
+            [],
+            """
+            Disable upstream certificate verification only for the given
+            targets, specified as ``<host>=`` entries (domain name or literal
+            IP address matched against SNI or connection address).
+
+            This is the scoped equivalent of ``ssl_insecure``: only matching
+            upstreams skip verification, every other target keeps full
+            verification. Every bypass is logged. Prefer
+            ``ssl_verify_upstream_trusted_ca_by_host`` (trust anchor) over
+            disabling verification where possible.
+            """,
+        )
+        self.add_option(
             "tcp_hosts",
             Sequence[str],
             [],

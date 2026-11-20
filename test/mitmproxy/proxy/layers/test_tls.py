@@ -506,6 +506,142 @@ class TestServerTLS:
         if sys.version_info >= (3, 13):
             assert tssl.obj.get_verified_chain()
 
+    def test_untrusted_cert_has_machine_category(self, tctx):
+        """A chain/name failure carries a structured category, not just text."""
+        playbook = tutils.Playbook(tls.ServerTLSLayer(tctx))
+        tctx.server.address = ("wrong.host.mitmproxy.org", 443)
+        tctx.server.sni = "wrong.host.mitmproxy.org"
+
+        tssl = SSLTest(server_side=True)
+        data = tutils.Placeholder(bytes)
+        tls_hook_data = tutils.Placeholder(TlsData)
+        assert (
+            playbook
+            >> events.DataReceived(tctx.client, b"open-connection")
+            << layer.NextLayerHook(tutils.Placeholder())
+            >> tutils.reply_next_layer(TlsEchoLayer)
+            << commands.OpenConnection(tctx.server)
+            >> tutils.reply(None)
+            << tls.TlsStartServerHook(tutils.Placeholder())
+            >> reply_tls_start_server()
+            << commands.SendData(tctx.server, data)
+        )
+        tssl.bio_write(data())
+        with pytest.raises(ssl.SSLWantReadError):
+            tssl.do_handshake()
+
+        assert (
+            playbook
+            >> events.DataReceived(tctx.server, tssl.bio_read())
+            << commands.Log(StrMatching("Server TLS handshake failed.*"), WARNING)
+            << tls.TlsFailedServerHook(tls_hook_data)
+            >> tutils.reply()
+            << commands.CloseConnection(tctx.server)
+            << commands.SendData(
+                tctx.client,
+                BytesMatching(
+                    b"open-connection failed: Certificate verify failed: "
+                    b"[Hh]ostname mismatch"
+                ),
+            )
+        )
+        # structured, machine-consumable classification
+        assert tls_hook_data().error_category == "name_mismatch"
+        assert tctx.server.tls_error_category == "name_mismatch"
+        # the historical human-readable wording is preserved, without any tag
+        assert tls_hook_data().conn.error.lower() == (
+            "certificate verify failed: hostname mismatch"
+        )
+        assert not tctx.server.tls_established
+
+    def test_not_tls_classification(self, tctx):
+        """A non-TLS answer is categorized separately from an untrusted chain."""
+        playbook = tutils.Playbook(tls.ServerTLSLayer(tctx))
+        tctx.server.state = ConnectionState.OPEN
+        tctx.server.sni = "example.mitmproxy.org"
+
+        data = tutils.Placeholder(bytes)
+        tls_hook_data = tutils.Placeholder(TlsData)
+        assert (
+            playbook
+            << tls.TlsStartServerHook(tutils.Placeholder())
+            >> reply_tls_start_server()
+            << commands.SendData(tctx.server, data)
+            >> events.DataReceived(tctx.server, b"HTTP/1.1 404 Not Found\r\n")
+            << commands.Log(
+                "Server TLS handshake failed. The remote server does not speak TLS.",
+                WARNING,
+            )
+            << tls.TlsFailedServerHook(tls_hook_data)
+            >> tutils.reply()
+            << commands.CloseConnection(tctx.server)
+        )
+        assert tls_hook_data().error_category == "not_tls"
+        assert tctx.server.tls_error_category == "not_tls"
+
+    def test_immediate_server_disconnect_is_transport_category(self, tctx):
+        """Acceptance 9: a silent disconnect is distinct from an untrusted cert."""
+        playbook = tutils.Playbook(tls.ServerTLSLayer(tctx))
+        # An already-open server connection makes the layer start immediately.
+        tctx.server.state = ConnectionState.OPEN
+        tctx.server.sni = "example.mitmproxy.org"
+
+        # ClientHello goes out, then the upstream closes without any alert.
+        data = tutils.Placeholder(bytes)
+        tls_hook_data = tutils.Placeholder(TlsData)
+        assert (
+            playbook
+            << tls.TlsStartServerHook(tutils.Placeholder())
+            >> reply_tls_start_server()
+            << commands.SendData(tctx.server, data)
+            >> events.ConnectionClosed(tctx.server)
+            << commands.Log("Server TLS handshake failed. connection closed", WARNING)
+            << tls.TlsFailedServerHook(tls_hook_data)
+            >> tutils.reply()
+            << commands.CloseConnection(tctx.server)
+        )
+        assert tls_hook_data().error_category == "transport_interrupted"
+        assert tctx.server.tls_error_category == "transport_interrupted"
+        # failed upstream is closed immediately, never marked established
+        assert not tctx.server.tls_established
+        assert tctx.client.tls_error_category is None
+
+    def test_failure_does_not_touch_other_connection(self, tctx):
+        """Acceptance 8: one target's failure leaves the client conn intact."""
+        playbook = tutils.Playbook(tls.ServerTLSLayer(tctx))
+        tctx.server.address = ("wrong.host.mitmproxy.org", 443)
+        tctx.server.sni = "wrong.host.mitmproxy.org"
+        tssl = SSLTest(server_side=True)
+        data = tutils.Placeholder(bytes)
+        assert (
+            playbook
+            >> events.DataReceived(tctx.client, b"open-connection")
+            << layer.NextLayerHook(tutils.Placeholder())
+            >> tutils.reply_next_layer(TlsEchoLayer)
+            << commands.OpenConnection(tctx.server)
+            >> tutils.reply(None)
+            << tls.TlsStartServerHook(tutils.Placeholder())
+            >> reply_tls_start_server()
+            << commands.SendData(tctx.server, data)
+        )
+        tssl.bio_write(data())
+        with pytest.raises(ssl.SSLWantReadError):
+            tssl.do_handshake()
+        assert (
+            playbook
+            >> events.DataReceived(tctx.server, tssl.bio_read())
+            << commands.Log(StrMatching("Server TLS handshake failed.*"), WARNING)
+            << tls.TlsFailedServerHook(tutils.Placeholder())
+            >> tutils.reply()
+            # only the server connection is closed, never the client
+            << commands.CloseConnection(tctx.server)
+            << commands.SendData(
+                tctx.client,
+                BytesMatching(b"open-connection failed: Certificate verify failed:.*"),
+            )
+        )
+        assert tctx.client.error is None
+
 
 def make_client_tls_layer(
     tctx: context.Context, **kwargs

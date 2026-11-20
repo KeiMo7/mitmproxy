@@ -700,3 +700,301 @@ def test_default_ciphers():
         tlsconfig._default_ciphers(net_tls.Version.UNBOUNDED)
         == tlsconfig._DEFAULT_CIPHERS_WITH_SECLEVEL_0
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-target upstream trust policy (scoped trust anchors / scoped bypasses)
+# ---------------------------------------------------------------------------
+
+VERIFICATIONCERTS = "mitmproxy/net/data/verificationcerts"
+
+
+def _mem_server(tdata, cert_name: str) -> SSL.Connection:
+    """A pyOpenSSL in-memory TLS server presenting the given test cert."""
+    sctx = SSL.Context(SSL.TLS_SERVER_METHOD)
+    sctx.use_certificate_file(tdata.path(f"{VERIFICATIONCERTS}/{cert_name}.crt"))
+    sctx.use_privatekey_file(tdata.path(f"{VERIFICATIONCERTS}/{cert_name}.key"))
+    server = SSL.Connection(sctx)
+    server.set_accept_state()
+    return server
+
+
+def _drive_handshake_until_error_or_done(
+    client: SSL.Connection, server: SSL.Connection
+) -> Exception | None:
+    """Pump a memory-BIO handshake, returning the client-side exception."""
+    try:
+        client.do_handshake()
+    except SSL.WantReadError:
+        pass
+    for _ in range(10):
+        try:
+            server.bio_write(client.bio_read(65535))
+            server.do_handshake()
+        except SSL.WantReadError:
+            pass
+        try:
+            client.bio_write(server.bio_read(65535))
+        except SSL.Error:
+            pass
+        try:
+            client.do_handshake()
+            return None
+        except SSL.WantReadError:
+            continue
+        except SSL.Error as e:
+            return e
+    return RuntimeError("handshake did not terminate")
+
+
+class TestPerTargetUpstreamTrust:
+    def _start(self, tctx, ta, host: str) -> SSL.Connection:
+        ctx = _ctx(tctx.options)
+        ctx.server.address = (host, 443)
+        tls_start = tls.TlsData(ctx.server, context=ctx)
+        ta.tls_start_server(tls_start)
+        return tls_start.ssl_conn
+
+    def test_self_signed_rejected_by_default(self, tdata, caplog):
+        """Acceptance 1: self-signed upstream rejected, chain-untrusted."""
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(ta, ssl_verify_upstream_trusted_ca=None)
+            client = self._start(tctx, ta, "example.mitmproxy.org")
+            server = _mem_server(tdata, "self-signed")
+            err = _drive_handshake_until_error_or_done(client, server)
+            assert isinstance(err, SSL.Error)
+            assert "certificate verify failed" in str(err)
+            verify_result = SSL._lib.SSL_get_verify_result(client._ssl)
+            from mitmproxy.net.upstream_trust import classify_verify_result
+            from mitmproxy.net.upstream_trust import TlsFailure
+
+            assert classify_verify_result(verify_result) is TlsFailure.UNTRUSTED_CHAIN
+
+    def test_trust_anchor_scoped_to_one_target(self, tdata):
+        """Acceptance 2: anchor applies only to its target; other self-signed fails."""
+        root = tdata.path(f"{VERIFICATIONCERTS}/trusted-root.crt")
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(
+                ta,
+                ssl_verify_upstream_trusted_ca=None,
+                ssl_verify_upstream_trusted_ca_by_host=[
+                    f"example.mitmproxy.org={root}"
+                ],
+            )
+
+            # The declared target trusts the anchor and handshakes successfully.
+            ok_client = self._start(tctx, ta, "example.mitmproxy.org")
+            ok_server = _mem_server(tdata, "trusted-leaf")
+            assert _drive_handshake_until_error_or_done(ok_client, ok_server) is None
+
+            # A different self-signed target must still be rejected.
+            other_client = self._start(tctx, ta, "other.example")
+            other_server = _mem_server(tdata, "self-signed")
+            other_err = _drive_handshake_until_error_or_done(other_client, other_server)
+            assert isinstance(other_err, SSL.Error)
+
+    def test_bypass_scoped_to_target_and_logged(self, tdata, caplog):
+        """A scoped bypass verifies nothing for its target, others stay verified."""
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(
+                ta,
+                ssl_verify_upstream_trusted_ca=None,
+                ssl_insecure_upstream_hosts=["bad.example="],
+            )
+            import logging
+
+            with caplog.at_level(logging.WARNING):
+                bypassed = self._start(tctx, ta, "bad.example")
+            assert bypassed.get_verify_mode() == SSL.VERIFY_NONE
+            assert any("DISABLED" in r.message for r in caplog.records)
+
+            verified = self._start(tctx, ta, "good.example")
+            assert verified.get_verify_mode() == SSL.VERIFY_PEER
+
+    def test_global_ssl_insecure_semantics_unchanged(self):
+        """Hard constraint 4: the global switch keeps its old all-or-nothing."""
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(ta, ssl_insecure=True)
+            conn = self._start(tctx, ta, "anything.example")
+            assert conn.get_verify_mode() == SSL.VERIFY_NONE
+
+    def test_ip_address_with_ip_san_passes(self, tdata):
+        """Acceptance 3: literal IP + cert with IP SAN verifies via the anchor."""
+        root = tdata.path(f"{VERIFICATIONCERTS}/trusted-root.crt")
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(
+                ta,
+                ssl_verify_upstream_trusted_ca=None,
+                ssl_verify_upstream_trusted_ca_by_host=[f"192.0.2.42={root}"],
+            )
+            client = self._start(tctx, ta, "192.0.2.42")
+            server = _mem_server(tdata, "trusted-leaf-ip")
+            assert _drive_handshake_until_error_or_done(client, server) is None
+
+    def test_ip_address_with_dns_only_cert_fails_name_mismatch(self, tdata):
+        """Acceptance 3: IP target but cert only has DNS entries -> name mismatch."""
+        root = tdata.path(f"{VERIFICATIONCERTS}/trusted-root.crt")
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(
+                ta,
+                ssl_verify_upstream_trusted_ca=None,
+                ssl_verify_upstream_trusted_ca_by_host=[f"192.0.2.42={root}"],
+            )
+            client = self._start(tctx, ta, "192.0.2.42")
+            # trusted-leaf only carries a DNS SAN, no IP entry
+            server = _mem_server(tdata, "trusted-leaf")
+            err = _drive_handshake_until_error_or_done(client, server)
+            assert isinstance(err, SSL.Error)
+            verify_result = SSL._lib.SSL_get_verify_result(client._ssl)
+            from mitmproxy.net.upstream_trust import classify_verify_result
+            from mitmproxy.net.upstream_trust import TlsFailure
+
+            assert classify_verify_result(verify_result) is TlsFailure.NAME_MISMATCH
+
+    def test_no_verifiable_name_without_sni(self):
+        """Acceptance 4: no SNI/name gives a categorized error, not a network error."""
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            ctx = _ctx(tctx.options)
+            ctx.server.address = ("example.mitmproxy.org", 443)
+            ctx.server.sni = ""  # explicitly opt out of a verification name
+            tls_start = tls.TlsData(ctx.server, context=ctx)
+            with pytest.raises(ValueError) as exc_info:
+                ta.tls_start_server(tls_start)
+            from mitmproxy.net.upstream_trust import parse_failure_category
+            from mitmproxy.net.upstream_trust import TlsFailure
+
+            assert (
+                parse_failure_category(str(exc_info.value))
+                == TlsFailure.NO_VERIFIABLE_NAME.value
+            )
+
+    def test_bad_anchor_path_fails_at_configure(self, tmp_path):
+        """Hard constraint / failure 1: unreadable anchor errors at startup."""
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            with pytest.raises(Exception):
+                tctx.configure(
+                    ta,
+                    ssl_verify_upstream_trusted_ca_by_host=[
+                        f"host.example={tmp_path / 'missing.pem'}"
+                    ],
+                )
+
+    def test_malformed_anchor_fails_at_configure(self, tmp_path):
+        bad = tmp_path / "bad.pem"
+        bad.write_text("not a certificate")
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            with pytest.raises(Exception):
+                tctx.configure(
+                    ta,
+                    ssl_verify_upstream_trusted_ca_by_host=[f"host.example={bad}"],
+                )
+
+    def test_sni_takes_precedence_for_verification_name(self, tdata):
+        """Acceptance 5: verification uses the tunnel SNI, visible via set host."""
+        root = tdata.path(f"{VERIFICATIONCERTS}/trusted-root.crt")
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(
+                ta,
+                ssl_verify_upstream_trusted_ca=None,
+                # anchor keyed to the SNI name, not the literal loopback address
+                ssl_verify_upstream_trusted_ca_by_host=[
+                    f"example.mitmproxy.org={root}"
+                ],
+            )
+            ctx = _ctx(tctx.options)
+            # address is loopback, but the client tunnel carries a distinct name
+            ctx.server.address = ("127.0.0.1", 443)
+            ctx.client.sni = "example.mitmproxy.org"
+            tls_start = tls.TlsData(ctx.server, context=ctx)
+            ta.tls_start_server(tls_start)
+            # policy matched on the SNI name even though address differs
+            policy = ta.upstream_trust.policy_for(ctx.server.sni, ctx.server.address[0])
+            assert policy.extra_ca_file == root
+
+    def test_same_target_reuses_ssl_context_within_session(self, tdata):
+        """Acceptance 7: identical targets reuse the cached verification context."""
+        root = tdata.path(f"{VERIFICATIONCERTS}/trusted-root.crt")
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(
+                ta,
+                ssl_verify_upstream_trusted_ca=None,
+                ssl_verify_upstream_trusted_ca_by_host=[
+                    f"example.mitmproxy.org={root}"
+                ],
+            )
+            first = self._start(tctx, ta, "example.mitmproxy.org")
+            second = self._start(tctx, ta, "example.mitmproxy.org")
+            # same underlying OpenSSL context object -> verification decision reused
+            assert first.get_context() is second.get_context()
+
+    def test_trust_change_invalidates_cached_context(self, tdata):
+        """Acceptance 7: a trust-config change yields a different context.
+
+        The OpenSSL context cache is keyed on all trust inputs, so changing
+        the per-target anchor changes the key and produces a fresh context
+        rather than silently reusing the pre-change verification decision.
+        """
+        root = tdata.path(f"{VERIFICATIONCERTS}/trusted-root.crt")
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(ta, ssl_verify_upstream_trusted_ca=None)
+            before = self._start(tctx, ta, "example.mitmproxy.org")
+            tctx.configure(
+                ta,
+                ssl_verify_upstream_trusted_ca_by_host=[
+                    f"example.mitmproxy.org={root}"
+                ],
+            )
+            after = self._start(tctx, ta, "example.mitmproxy.org")
+            assert before.get_context() is not after.get_context()
+
+    def test_quic_scoped_anchor_uses_combined_bundle(self, tdata):
+        """QUIC path applies the same per-target anchor (via a combined bundle)."""
+        root = tdata.path(f"{VERIFICATIONCERTS}/trusted-root.crt")
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(
+                ta,
+                ssl_verify_upstream_trusted_ca=None,
+                ssl_verify_upstream_trusted_ca_by_host=[
+                    f"example.mitmproxy.org={root}"
+                ],
+            )
+            ctx = _ctx(tctx.options)
+            ctx.server.address = ("example.mitmproxy.org", 443)
+            quic_start = quic.QuicTlsData(ctx.server, context=ctx)
+            ta.quic_start_server(quic_start)
+            assert quic_start.settings.verify_mode == ssl.CERT_REQUIRED
+            assert quic_start.settings.ca_file == (
+                ta.upstream_trust.combined_ca_bundle(root)
+            )
+
+    def test_quic_unmatched_target_keeps_system_store(self, tdata):
+        """QUIC path does not leak the anchor to other targets."""
+        root = tdata.path(f"{VERIFICATIONCERTS}/trusted-root.crt")
+        ta = tlsconfig.TlsConfig()
+        with taddons.context(ta) as tctx:
+            tctx.configure(
+                ta,
+                ssl_verify_upstream_trusted_ca=None,
+                ssl_verify_upstream_trusted_ca_by_host=[
+                    f"example.mitmproxy.org={root}"
+                ],
+            )
+            ctx = _ctx(tctx.options)
+            ctx.server.address = ("other.example", 443)
+            quic_start = quic.QuicTlsData(ctx.server, context=ctx)
+            ta.quic_start_server(quic_start)
+            assert quic_start.settings.ca_file is None
+            assert quic_start.settings.verify_mode == ssl.CERT_REQUIRED

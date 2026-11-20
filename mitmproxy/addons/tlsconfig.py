@@ -20,6 +20,10 @@ from mitmproxy import exceptions
 from mitmproxy import http
 from mitmproxy import tls
 from mitmproxy.net import tls as net_tls
+from mitmproxy.net.upstream_trust import format_failure
+from mitmproxy.net.upstream_trust import TargetPolicy
+from mitmproxy.net.upstream_trust import TlsFailure
+from mitmproxy.net.upstream_trust import UpstreamTrustConfig
 from mitmproxy.options import CONF_BASENAME
 from mitmproxy.proxy import context
 from mitmproxy.proxy.layers import modes
@@ -136,6 +140,8 @@ class TlsConfig:
     """
 
     certstore: certs.CertStore = None  # type: ignore
+
+    upstream_trust: UpstreamTrustConfig = UpstreamTrustConfig()
 
     # TODO: We should support configuring TLS 1.3 cipher suites (https://github.com/mitmproxy/mitmproxy/issues/4260)
     # TODO: We should re-use SSL.Context options here, if only for TLS session resumption.
@@ -311,13 +317,25 @@ class TlsConfig:
         server: connection.Server = tls_start.conn
         assert server.address
 
+        if server.sni is None:
+            server.sni = client.sni or server.address[0]
+
+        # Resolve the scoped, per-target trust policy.  The global
+        # ``ssl_insecure`` switch keeps its original all-or-nothing semantics;
+        # the new policy can only additionally relax verification for the
+        # explicitly declared targets.
         if ctx.options.ssl_insecure:
+            policy = TargetPolicy(verify=False, extra_ca_file=None, matched_spec=None)
+        else:
+            policy = self.upstream_trust.policy_for(
+                server_sni=server.sni,
+                server_address_host=server.address[0],
+            )
+
+        if not policy.verify:
             verify = net_tls.Verify.VERIFY_NONE
         else:
             verify = net_tls.Verify.VERIFY_PEER
-
-        if server.sni is None:
-            server.sni = client.sni or server.address[0]
 
         if not server.alpn_offers:
             if client.alpn_offers:
@@ -367,6 +385,7 @@ class TlsConfig:
             verify=verify,
             ca_path=ctx.options.ssl_verify_upstream_trusted_confdir,
             ca_pemfile=ctx.options.ssl_verify_upstream_trusted_ca,
+            extra_ca_pemfile=policy.extra_ca_file,
             client_cert=client_cert,
             legacy_server_connect=ctx.options.ssl_insecure,
         )
@@ -386,7 +405,19 @@ class TlsConfig:
             try:
                 ip: bytes = ipaddress.ip_address(server.sni).packed
             except ValueError:
-                host_name = server.sni.encode("idna")
+                try:
+                    host_name = server.sni.encode("idna")
+                except UnicodeError as e:
+                    # An illegal/non-encodable name means we cannot even build
+                    # the verification identity. This is not a mismatch: report
+                    # it as "no verifiable name available".
+                    raise ValueError(
+                        format_failure(
+                            TlsFailure.NO_VERIFIABLE_NAME,
+                            f"Cannot encode hostname {server.sni!r} for "
+                            f"certificate verification: {e}",
+                        )
+                    ) from e
                 tls_start.ssl_conn.set_tlsext_host_name(host_name)
                 ok = SSL._lib.X509_VERIFY_PARAM_set1_host(  # type: ignore
                     param, host_name, len(host_name)
@@ -398,7 +429,12 @@ class TlsConfig:
                 ok = SSL._lib.X509_VERIFY_PARAM_set1_ip(param, ip, len(ip))  # type: ignore
                 SSL._openssl_assert(ok == 1)  # type: ignore
         elif verify is not net_tls.Verify.VERIFY_NONE:
-            raise ValueError("Cannot validate certificate hostname without SNI")
+            raise ValueError(
+                format_failure(
+                    TlsFailure.NO_VERIFIABLE_NAME,
+                    "Cannot validate certificate hostname without SNI",
+                )
+            )
 
         if server.alpn_offers:
             tls_start.ssl_conn.set_alpn_protos(list(server.alpn_offers))
@@ -459,13 +495,21 @@ class TlsConfig:
         server: connection.Server = tls_start.conn
         assert server.address
 
+        if server.sni is None:
+            server.sni = client.sni or server.address[0]
+
         if ctx.options.ssl_insecure:
+            policy = TargetPolicy(verify=False, extra_ca_file=None, matched_spec=None)
+        else:
+            policy = self.upstream_trust.policy_for(
+                server_sni=server.sni,
+                server_address_host=server.address[0],
+            )
+
+        if not policy.verify:
             tls_start.settings.verify_mode = ssl.CERT_NONE
         else:
             tls_start.settings.verify_mode = ssl.CERT_REQUIRED
-
-        if server.sni is None:
-            server.sni = client.sni or server.address[0]
 
         if not server.alpn_offers:
             if client.alpn_offers:
@@ -490,7 +534,13 @@ class TlsConfig:
         # set the certificates
         # NOTE client certificates are not supported
         tls_start.settings.ca_path = ctx.options.ssl_verify_upstream_trusted_confdir
-        tls_start.settings.ca_file = ctx.options.ssl_verify_upstream_trusted_ca
+        if policy.extra_ca_file is not None:
+            # aioquic accepts only one cafile, hand it a system+anchor bundle.
+            tls_start.settings.ca_file = self.upstream_trust.combined_ca_bundle(
+                policy.extra_ca_file
+            )
+        else:
+            tls_start.settings.ca_file = ctx.options.ssl_verify_upstream_trusted_ca
 
     def running(self):
         # FIXME: We have a weird bug where the contract for configure is not followed and it is never called with
@@ -563,6 +613,22 @@ class TlsConfig:
                     raise exceptions.OptionsError(
                         f"Invalid certificate format for {cert}: {e}"
                     ) from e
+
+        if (
+            "ssl_verify_upstream_trusted_ca_by_host" in updated
+            or "ssl_insecure_upstream_hosts" in updated
+            or not updated
+        ):
+            # Parse and validate eagerly: an unreadable/malformed trust anchor
+            # or a malformed host spec is a startup error, not a first-connection
+            # failure. On rollback (invalid value) the previous config is kept.
+            try:
+                self.upstream_trust = UpstreamTrustConfig(
+                    extra_ca_specs=ctx.options.ssl_verify_upstream_trusted_ca_by_host,
+                    insecure_specs=ctx.options.ssl_insecure_upstream_hosts,
+                )
+            except ValueError as e:
+                raise exceptions.OptionsError(str(e)) from e
 
         if "tls_ecdh_curve_client" in updated or "tls_ecdh_curve_server" in updated:
             for ecdh_curve in [
