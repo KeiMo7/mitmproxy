@@ -15,6 +15,7 @@ from mitmproxy import tls
 from mitmproxy.addons import tlsconfig
 from mitmproxy.net import tls as net_tls
 from mitmproxy.proxy import context
+from mitmproxy.proxy import server_hooks
 from mitmproxy.proxy.layers import modes
 from mitmproxy.proxy.layers import quic
 from mitmproxy.proxy.layers import tls as proxy_tls
@@ -700,3 +701,152 @@ def test_default_ciphers():
         tlsconfig._default_ciphers(net_tls.Version.UNBOUNDED)
         == tlsconfig._DEFAULT_CIPHERS_WITH_SECLEVEL_0
     )
+
+
+def test_apply_replayed_tls_context_alpn():
+    ta = tlsconfig.TlsConfig()
+    with taddons.context(ta) as tctx:
+        ctx = _ctx(tctx.options)
+        ctx.server.address = ("example.mitmproxy.org", 443)
+        ctx.extra["session_replay"] = {"alpn_offers": (b"h2", b"http/1.1")}
+        tls_start = tls.TlsData(ctx.server, context=ctx)
+        ta.tls_start_server(tls_start)
+        assert ctx.server.alpn_offers == (b"h2", b"http/1.1")
+        assert tls_start.ssl_conn.get_alpn_proto_negotiated() == b""
+
+
+def test_apply_replayed_tls_context_invalid_alpn():
+    ta = tlsconfig.TlsConfig()
+    with taddons.context(ta) as tctx:
+        ctx = _ctx(tctx.options)
+        ctx.server.address = ("example.mitmproxy.org", 443)
+        ctx.extra["session_replay"] = {"alpn_offers": (b"not a valid alpn\x00",)}
+        tls_start = tls.TlsData(ctx.server, context=ctx)
+        ta.tls_start_server(tls_start)
+        assert tls_start.ssl_conn
+
+
+def test_apply_replayed_tls_context_invalid_ticket():
+    ta = tlsconfig.TlsConfig()
+    with taddons.context(ta) as tctx:
+        ctx = _ctx(tctx.options)
+        ctx.server.address = ("example.mitmproxy.org", 443)
+        ctx.extra["session_replay"] = {"session_ticket": b"not a session"}
+        tls_start = tls.TlsData(ctx.server, context=ctx)
+        ta.tls_start_server(tls_start)
+        assert ctx.extra["session_replay"]["session_ticket_applied"] is False
+
+
+def test_apply_replayed_tls_context_no_replay_data():
+    """Without replay metadata, tls_start_server behaves as before."""
+    ta = tlsconfig.TlsConfig()
+    with taddons.context(ta) as tctx:
+        ctx = _ctx(tctx.options)
+        ctx.server.address = ("example.mitmproxy.org", 443)
+        tls_start = tls.TlsData(ctx.server, context=ctx)
+        ta.tls_start_server(tls_start)
+        assert tls_start.ssl_conn
+
+
+def test_tls_established_server_capture(monkeypatch):
+    from mitmproxy.addons import sessionplayback
+
+    class FakeSslConn:
+        def get_session(self):
+            return "session"
+
+    monkeypatch.setattr(
+        "mitmproxy.net.tls.serialize_session", lambda session: b"ticket"
+    )
+
+    ta = tlsconfig.TlsConfig()
+    with taddons.context(ta, sessionplayback.SessionPlayback()) as tctx:
+        tctx.configure(ta, session_replay_capture=True)
+        ctx = _ctx(tctx.options)
+        ctx.server.address = ("example.mitmproxy.org", 443)
+        fake = FakeSslConn()
+        ta.tls_established_server(
+            tls.TlsData(ctx.server, context=ctx, ssl_conn=fake)  # type: ignore
+        )
+        assert (
+            tlsconfig.session_context.snapshot_tls_session(ctx.server.id) == b"ticket"
+        )
+        tlsconfig.session_context.forget_live_session(ctx.server.id)
+
+        # No ssl_conn: nothing is recorded.
+        ta.tls_established_server(tls.TlsData(ctx.server, context=ctx))
+        assert tlsconfig.session_context.snapshot_tls_session(ctx.server.id) is None
+
+        # A client connection is not an upstream connection.
+        ta.tls_established_server(
+            tls.TlsData(ctx.client, context=ctx, ssl_conn=fake)  # type: ignore
+        )
+        assert tlsconfig.session_context.snapshot_tls_session(ctx.client.id) is None
+
+        # Disabled: nothing is recorded.
+        tctx.options.session_replay_capture = False
+        ta.tls_established_server(
+            tls.TlsData(ctx.server, context=ctx, ssl_conn=fake)  # type: ignore
+        )
+        assert tlsconfig.session_context.snapshot_tls_session(ctx.server.id) is None
+
+        # Disconnecting the server drops the remembered session.
+        tctx.options.session_replay_capture = True
+        ta.tls_established_server(
+            tls.TlsData(ctx.server, context=ctx, ssl_conn=fake)  # type: ignore
+        )
+        assert (
+            tlsconfig.session_context.snapshot_tls_session(ctx.server.id) == b"ticket"
+        )
+        ta.server_disconnect(
+            server_hooks.ServerConnectionHookData(server=ctx.server, client=ctx.client)
+        )
+        assert tlsconfig.session_context.snapshot_tls_session(ctx.server.id) is None
+
+
+def test_apply_replayed_tls_context_session_ticket(monkeypatch):
+    """A captured session ticket is re-applied to the upstream connection."""
+    applied = []
+
+    class FakeSession:
+        pass
+
+    from OpenSSL import SSL as PySSL
+
+    def fake_deserialize(data, context):
+        fake = object.__new__(PySSL.Session)
+        fake._session = PySSL._ffi.NULL  # type: ignore
+        fake._context = context  # type: ignore
+        return fake
+
+    monkeypatch.setattr(tlsconfig.net_tls, "deserialize_session", fake_deserialize)
+
+    ta = tlsconfig.TlsConfig()
+    with taddons.context(ta) as tctx:
+        ctx = _ctx(tctx.options)
+        ctx.server.address = ("example.mitmproxy.org", 443)
+        ctx.extra["session_replay"] = {"session_ticket": b"ticket"}
+        tls_start = tls.TlsData(ctx.server, context=ctx)
+        ta.tls_start_server(tls_start)
+        applied.append(ctx.extra["session_replay"]["session_ticket_applied"])
+
+        # An incompatible context raises ValueError and leaves the flag False.
+        def raise_value_error(self, session):
+            raise ValueError("wrong context")
+
+        monkeypatch.setattr(SSL.Connection, "set_session", raise_value_error)
+        ctx.extra["session_replay"] = {"session_ticket": b"ticket"}
+        tls_start2 = tls.TlsData(ctx.server, context=ctx)
+        ta.tls_start_server(tls_start2)
+        applied.append(ctx.extra["session_replay"]["session_ticket_applied"])
+
+        # Malformed tickets are ignored.
+        def raise_deserialize(data, ctx_):
+            raise ValueError("malformed")
+
+        monkeypatch.setattr(tlsconfig.net_tls, "deserialize_session", raise_deserialize)
+        ctx.extra["session_replay"] = {"session_ticket": b"bad"}
+        tls_start3 = tls.TlsData(ctx.server, context=ctx)
+        ta.tls_start_server(tls_start3)
+
+    assert applied == [True, False]

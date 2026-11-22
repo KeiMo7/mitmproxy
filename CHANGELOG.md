@@ -7,6 +7,13 @@
 
 ## Unreleased: mitmproxy next
 
+- Add session-context replay (`session_replay`): captured requests are replayed
+  with the connection ordering, the cookies and the TLS parameters they were
+  captured with. The report identifies the first request whose response diverges
+  from the capture, distinguishes environmental from behavioural differences, and
+  verifies that repeated replays produce identical results. Sessions can be sliced
+  by domain, time window and request count. Missing context is reported as an
+  explicit degraded replay.
 - Show the traceback when client replay crashes.
   ([#8614](https://github.com/mitmproxy/mitmproxy/pull/8614), @Giardi77)
 - Speed up addon event dispatch by skipping addons that don't implement the event.

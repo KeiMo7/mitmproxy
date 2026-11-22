@@ -70,6 +70,15 @@ export interface OptionsState {
     server_replay_refresh: boolean;
     server_replay_reuse: boolean;
     server_replay_use_headers: string[];
+    session_replay: string[];
+    session_replay_capture: boolean;
+    session_replay_concurrency: number;
+    session_replay_domain: string[];
+    session_replay_end: string | undefined;
+    session_replay_limit: number;
+    session_replay_runs: number;
+    session_replay_start: string | undefined;
+    session_replay_tls: boolean;
     show_ignored_hosts: boolean;
     showhost: boolean;
     ssl_insecure: boolean;
@@ -180,6 +189,15 @@ export const defaultState: OptionsState = {
     server_replay_refresh: true,
     server_replay_reuse: false,
     server_replay_use_headers: [],
+    session_replay: [],
+    session_replay_capture: false,
+    session_replay_concurrency: 1,
+    session_replay_domain: [],
+    session_replay_end: undefined,
+    session_replay_limit: 0,
+    session_replay_runs: 1,
+    session_replay_start: undefined,
+    session_replay_tls: true,
     show_ignored_hosts: false,
     showhost: false,
     ssl_insecure: false,

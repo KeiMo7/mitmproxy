@@ -23,6 +23,7 @@ from mitmproxy.addons import save
 from mitmproxy.addons import savehar
 from mitmproxy.addons import script
 from mitmproxy.addons import serverplayback
+from mitmproxy.addons import sessionplayback
 from mitmproxy.addons import stickyauth
 from mitmproxy.addons import stickycookie
 from mitmproxy.addons import strip_dns_https_records
@@ -53,6 +54,7 @@ def default_addons():
         dns_resolver.DnsResolver(),
         next_layer.NextLayer(),
         serverplayback.ServerPlayback(),
+        sessionplayback.SessionPlayback(),
         mapremote.MapRemote(),
         maplocal.MapLocal(),
         modifybody.ModifyBody(),

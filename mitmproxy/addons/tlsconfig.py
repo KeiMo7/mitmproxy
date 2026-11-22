@@ -18,6 +18,7 @@ from mitmproxy import connection
 from mitmproxy import ctx
 from mitmproxy import exceptions
 from mitmproxy import http
+from mitmproxy import session as session_context
 from mitmproxy import tls
 from mitmproxy.net import tls as net_tls
 from mitmproxy.options import CONF_BASENAME
@@ -128,6 +129,48 @@ def alpn_select_callback(conn: SSL.Connection, options: list[bytes]) -> Any:
             return alpn
     else:
         return SSL.NO_OVERLAPPING_PROTOCOLS
+
+
+def _apply_replayed_tls_context(tls_start: tls.TlsData) -> None:
+    """
+    Replay captured upstream TLS parameters for session-context replay.
+
+    Client playback tags its context with the captured TLS context. We apply
+    the ALPN offers and the (previously captured) session ticket here, before
+    the handshake starts, so the upstream server sees the same negotiated
+    parameters as during the original capture.
+    """
+    replay = tls_start.context.extra.get("session_replay")
+    if not replay:
+        return
+    assert tls_start.ssl_conn is not None
+    server = tls_start.conn
+    if not isinstance(server, connection.Server):  # pragma: no cover
+        return
+    alpn_offers = replay.get("alpn_offers") or ()
+    if alpn_offers:
+        server.alpn_offers = tuple(alpn_offers)
+        try:
+            tls_start.ssl_conn.set_alpn_protos(list(alpn_offers))
+        except SSL.Error:  # pragma: no cover - invalid captured offers
+            pass
+    ticket = replay.get("session_ticket")
+    if ticket:
+        replay["session_ticket_applied"] = False
+        try:
+            session = net_tls.deserialize_session(
+                ticket, tls_start.ssl_conn.get_context()
+            )
+        except ValueError:  # pragma: no cover - malformed ticket
+            return
+        # pyOpenSSL only allows sessions that belong to the exact same context.
+        # Our TLS contexts are cached, so this normally succeeds. If it does
+        # not, the session is simply not resumed and remains flagged as such.
+        try:
+            tls_start.ssl_conn.set_session(session)
+        except ValueError:  # pragma: no cover - incompatible context
+            return
+        replay["session_ticket_applied"] = True
 
 
 class TlsConfig:
@@ -372,6 +415,7 @@ class TlsConfig:
         )
 
         tls_start.ssl_conn = SSL.Connection(ssl_ctx)
+        _apply_replayed_tls_context(tls_start)
         if server.sni:
             # We need to set SNI + enable hostname verification.
             assert isinstance(server.sni, str)
@@ -491,6 +535,27 @@ class TlsConfig:
         # NOTE client certificates are not supported
         tls_start.settings.ca_path = ctx.options.ssl_verify_upstream_trusted_confdir
         tls_start.settings.ca_file = ctx.options.ssl_verify_upstream_trusted_ca
+
+    def tls_established_server(self, data: tls.TlsData) -> None:
+        """
+        Remember the upstream TLS session for session-context replay.
+
+        Session tickets are only present after the handshake has completed (and
+        for TLS 1.3 only after the first application data was read), so we
+        snapshot them as part of the live flow.
+        """
+        if not getattr(ctx.options, "session_replay_capture", False):
+            return
+        if not isinstance(data.conn, connection.Server):
+            return
+        if data.ssl_conn is None:  # pragma: no cover - tls_start_server sets this
+            return
+        session_context.register_live_session(data.conn.id, data.ssl_conn)
+
+    def server_disconnect(self, data) -> None:
+        """Drop the remembered TLS connection once the server connection is gone."""
+        if isinstance(data.server, connection.Server):
+            session_context.forget_live_session(data.server.id)
 
     def running(self):
         # FIXME: We have a weird bug where the contract for configure is not followed and it is never called with

@@ -306,6 +306,50 @@ def accept_all(
     return True
 
 
+def serialize_session(session: SSL.Session) -> bytes:
+    """
+    Serialize a TLS session (including the ticket for TLS 1.3) into bytes.
+
+    TLS session resumption state cannot be reconstructed from a captured flow
+    after the fact, so we persist it explicitly when capturing.
+    """
+    buf = SSL._ffi.new("unsigned char **")
+    length = SSL._lib.i2d_SSL_SESSION(session._session, buf)  # type: ignore
+    if length <= 0:  # pragma: no cover - only on memory errors
+        raise ValueError("Cannot serialize TLS session.")
+    try:
+        return bytes(SSL._ffi.buffer(buf[0], length))  # type: ignore
+    finally:
+        SSL._lib.OPENSSL_free(buf[0])  # type: ignore
+
+
+def deserialize_session(data: bytes, context: SSL.Context) -> SSL.Session:
+    """
+    Deserialize bytes produced by `serialize_session` into a `SSL.Session`
+    that is usable with the given context.
+    """
+    array = SSL._ffi.new("unsigned char[]", data)
+    ptr = SSL._ffi.new("unsigned char **")
+    ptr[0] = SSL._ffi.cast("unsigned char *", array)  # type: ignore
+    session_ptr = SSL._lib.d2i_SSL_SESSION(  # type: ignore
+        SSL._ffi.NULL, ptr, len(data)
+    )
+    if session_ptr == SSL._ffi.NULL:  # pragma: no cover - malformed input
+        raise ValueError("Cannot deserialize TLS session.")
+    session = SSL.Session.__new__(SSL.Session)
+    session._session = SSL._ffi.gc(  # type: ignore
+        session_ptr,
+        SSL._lib.SSL_SESSION_free,  # type: ignore
+    )
+    session._context = context  # type: ignore
+    return session
+
+
+def session_reused(conn: SSL.Connection) -> bool:
+    """`True` if the TLS session has been resumed instead of fully negotiated."""
+    return bool(SSL._lib.SSL_session_reused(conn._ssl))  # type: ignore
+
+
 def starts_like_tls_record(d: bytes) -> bool:
     """
     Returns:

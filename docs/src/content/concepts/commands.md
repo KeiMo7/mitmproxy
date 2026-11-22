@@ -59,6 +59,17 @@ just replay flows for a specific domain:
 :replay.client "~d google.com"
 ```
 
+If you need to reproduce the *context* of a captured session rather than just
+the requests, use the session replay commands instead. They replay requests on
+the connections they were captured on, with the cookies that were valid at the
+time, and report where the replayed responses diverge from the capture:
+
+```
+:replay.session @all
+```
+
+See [Session Replay]({{< relref "/howto/session-replay" >}}) for details.
+
 # Custom Key Bindings
 
 Mitmproxy's key bindings can be customized to your needs in the
